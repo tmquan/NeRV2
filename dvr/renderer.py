@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
-from pytorch3d.structures import Volumes
 
+from kornia.enhance import equalize
+from pytorch3d.structures import Volumes
 from pytorch3d.renderer import (
     VolumeRenderer,
     NDCMultinomialRaysampler,
@@ -20,6 +21,9 @@ def normalized(x, eps=1e-8):
 
 def standardized(x, eps=1e-8):
     return (x - x.mean()) / (x.std() + eps)  # 1e-6 to avoid zero division
+
+def equalized(x, eps=1e-8):
+    return equalize(x)
 
 
 class DirectVolumeRenderer(nn.Module):
@@ -63,6 +67,8 @@ class DirectVolumeRenderer(nn.Module):
             screen_RGB = normalized(screen_RGB)
         elif norm_type == "standardized":
             screen_RGB = normalized(standardized(screen_RGB))
+        elif norm_type == "equalized":
+            screen_RGB = equalized(normalized(standardized(screen_RGB)))
 
         if return_bundle:
             return screen_RGB, bundle

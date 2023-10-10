@@ -42,6 +42,8 @@ from pytorch3d.renderer.cameras import (
     look_at_view_transform,
 )
 
+from pytorch_histogram_matching import Histogram_Matching
+
 from datamodule import UnpairedDataModule
 from dvr.renderer import DirectVolumeFrontToBackRenderer
 from nerv2.renderer import NeRVFrontToBackInverseRenderer
@@ -76,7 +78,16 @@ def make_cameras_dea(
         return FoVOrthographicCameras(R=R, T=T, znear=znear, zfar=zfar).to(_device)
     return FoVPerspectiveCameras(R=R, T=T, fov=fov, znear=znear, zfar=zfar).to(_device)
 
-
+class HistogramMatchingLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l1loss = nn.L1Loss(reduction="mean")
+        self.hmatch = Histogram_Matching(differentiable=True)
+        
+    def forward(self, ref, dst):
+        rst = self.hmatch(dst, ref)
+        return self.l1loss(dst, rst)        
+        
 class DXRLightningModule(LightningModule):
     def __init__(self, hparams, **kwargs):
         super().__init__()
@@ -153,21 +164,21 @@ class DXRLightningModule(LightningModule):
         self.train_step_outputs = []
         self.validation_step_outputs = []
         self.l1loss = nn.L1Loss(reduction="mean")
-        
-        self.piloss = PerceptualLoss(
-            spatial_dims=2, 
-            network_type="radimagenet_resnet50", 
-            is_fake_3d=False, 
-            pretrained=True
-        )
+        self.hmloss = HistogramMatchingLoss()
+        # self.hmloss = PerceptualLoss(
+        #     spatial_dims=2, 
+        #     network_type="radimagenet_resnet50", 
+        #     is_fake_3d=False, 
+        #     pretrained=True
+        # )
             
         self.psnr = PeakSignalNoiseRatio(data_range=(0, 1))
         self.ssim = StructuralSimilarityIndexMeasure(data_range=(0, 1))
         self.psnr_outputs = []
         self.ssim_outputs = []
     
-    def forward_screen(self, image3d, cameras, opacity, scale=0.1):
-        screen = self.fwd_renderer(image3d, cameras, opacity, scale) 
+    def forward_screen(self, image3d, cameras, opacity=None, norm_type="standardized", scale=0.1):
+        screen = self.fwd_renderer(image3d, cameras, opacity, norm_type, scale) 
         return screen
 
     def forward_volume(self, image2d, cameras, timesteps=None):
@@ -195,10 +206,10 @@ class DXRLightningModule(LightningModule):
         
         # From XR -> image3d -> opacity -> XR
         figure_xr_hidden = image2d
-        volume_xr_hidden, middle_xr_hidden = self.forward_volume(figure_xr_hidden, view_hidden)
-        opaque_xr_hidden = self.forward_opaque(volume_xr_hidden)
-        figure_xr_hidden_second_hidden = self.forward_screen(volume_xr_hidden, view_hidden, opaque_xr_hidden, scale=0.1)
-        figure_xr_hidden_second_random = self.forward_screen(volume_xr_hidden, view_random, opaque_xr_hidden, scale=0.1)
+        # volume_xr_hidden, middle_xr_hidden = self.forward_volume(figure_xr_hidden, view_hidden)
+        # opaque_xr_hidden = self.forward_opaque(volume_xr_hidden)
+        # figure_xr_hidden_second_hidden = self.forward_screen(volume_xr_hidden, view_hidden, opaque_xr_hidden, scale=0.1)
+        # figure_xr_hidden_second_random = self.forward_screen(volume_xr_hidden, view_random, opaque_xr_hidden, scale=0.1)
         
         # From CT -> opacity -> Project -> Volume
         # volume_ct_hidden = image3d
@@ -214,40 +225,74 @@ class DXRLightningModule(LightningModule):
         # figure_ct_random_hidden = self.forward_screen(volume_ct_random, view_hidden, opaque_ct_random, scale=0.1)
         # volume_ct_random_second, \
         # middle_ct_random_second = self.forward_volume(figure_ct_random, view_random)
+        
         volume_ct_hidden = image3d
         volume_ct_random = image3d
-        volume_dx = torch.cat([volume_ct_hidden, volume_ct_random])
-        opaque_dx = self.forward_opaque(volume_dx)
-        opaque_ct_hidden, opaque_ct_random = torch.split(opaque_dx, batchsz)
-        figure_dx = self.forward_screen(volume_dx, 
+        volume_ct = torch.cat([volume_ct_hidden, volume_ct_random])
+        opaque_ct = self.forward_opaque(volume_ct)
+        opaque_ct_hidden, opaque_ct_random = torch.split(opaque_ct, batchsz)
+        figure_ct = self.forward_screen(volume_ct, 
                                         join_cameras_as_batch([view_hidden, view_random]),
-                                        opaque_dx, scale=0.1)
-        figure_ct_hidden, figure_ct_random = torch.split(figure_dx, batchsz)
+                                        opaque_ct, scale=0.1)
+        
+        # figure_ct = self.forward_screen(volume_ct, 
+        #                                 join_cameras_as_batch([view_hidden, view_random]),
+        #                                 norm_type="equalized", scale=0.1)
+        
+        figure_ct_hidden, figure_ct_random = torch.split(figure_ct, batchsz)
+        figure_dx = torch.cat([figure_xr_hidden, figure_ct_hidden, figure_ct_random])
         
         volume_dx_second, \
-        middle_dx_second = self.forward_volume(figure_dx, join_cameras_as_batch([view_hidden, view_random]))
+        middle_dx_second = self.forward_volume(figure_dx, join_cameras_as_batch([view_hidden, view_hidden, view_random]))
         opaque_dx_second = self.forward_opaque(volume_dx_second)
-        volume_ct_hidden_second, volume_ct_random_second = torch.split(volume_dx_second, batchsz)
-        middle_ct_hidden_second, middle_ct_random_second = torch.split(middle_dx_second, batchsz)
-        figure_dx_second = self.forward_screen(torch.cat([volume_dx_second, volume_dx_second]), 
-                                               join_cameras_as_batch([view_hidden, view_hidden, view_random, view_random]),
-                                               torch.cat([opaque_dx_second, opaque_dx_second]), scale=0.1)
+        
+        opaque_xr_hidden_second, opaque_ct_hidden_second, opaque_ct_random_second = torch.split(opaque_dx_second, batchsz)
+        volume_xr_hidden_second, volume_ct_hidden_second, volume_ct_random_second = torch.split(volume_dx_second, batchsz)
+        middle_xr_hidden_second, middle_ct_hidden_second, middle_ct_random_second = torch.split(middle_dx_second, batchsz)
+        
+        figure_dx_second = self.forward_screen(torch.cat([volume_xr_hidden_second,
+                                                          volume_xr_hidden_second, 
+                                                          volume_ct_hidden_second, 
+                                                          volume_ct_hidden_second, 
+                                                          volume_ct_random_second,
+                                                          volume_ct_random_second]), 
+                                               join_cameras_as_batch([view_hidden, 
+                                                                      view_random, 
+                                                                      view_hidden, 
+                                                                      view_random, 
+                                                                      view_hidden, 
+                                                                      view_random]),
+                                               torch.cat([opaque_xr_hidden_second, 
+                                                          opaque_xr_hidden_second, 
+                                                          opaque_ct_hidden_second, 
+                                                          opaque_ct_hidden_second, 
+                                                          opaque_ct_random_second, 
+                                                          opaque_ct_random_second]), 
+                                               scale=0.1)
+        figure_xr_hidden_second_hidden, \
+        figure_xr_hidden_second_random, \
         figure_ct_hidden_second_hidden, \
-        figure_ct_random_second_hidden, \
         figure_ct_hidden_second_random, \
+        figure_ct_random_second_hidden, \
         figure_ct_random_second_random = torch.split(figure_dx_second, batchsz)
         
         im2d_loss = self.l1loss(figure_xr_hidden, figure_xr_hidden_second_hidden) \
-                  + self.l1loss(figure_ct_hidden, figure_ct_hidden_second_hidden) \
-                  + self.l1loss(figure_ct_hidden, figure_ct_random_second_hidden) \
-                  + self.l1loss(figure_ct_random, figure_ct_hidden_second_random) \
-                  + self.l1loss(figure_ct_random, figure_ct_random_second_random) 
+                #   + self.l1loss(figure_ct_hidden, figure_ct_hidden_second_hidden) \
+                #   + self.l1loss(figure_ct_hidden, figure_ct_random_second_hidden) \
+                #   + self.l1loss(figure_ct_random, figure_ct_hidden_second_random) \
+                #   + self.l1loss(figure_ct_random, figure_ct_random_second_random) 
                       
         im3d_loss = self.l1loss(volume_ct_hidden, volume_ct_hidden_second) + self.l1loss(volume_ct_hidden, middle_ct_hidden_second) \
                   + self.l1loss(volume_ct_random, volume_ct_random_second) + self.l1loss(volume_ct_random, middle_ct_random_second) 
                   
-        perc_loss = self.piloss(figure_xr_hidden.clamp(0.0, 1.0), figure_ct_hidden.clamp(0.0, 1.0) ) \
-                  + self.piloss(figure_ct_random.clamp(0.0, 1.0), figure_xr_hidden_second_random.clamp(0.0, 1.0) ) \
+        # hist_loss = self.hmloss(figure_xr_hidden, figure_ct_hidden_second_hidden) \
+        #           + self.hmloss(figure_xr_hidden, figure_ct_random_second_hidden) \
+        #           + self.hmloss(figure_ct_random, figure_xr_hidden_second_random) \
+        
+        hist_loss = self.hmloss(figure_xr_hidden, figure_ct_hidden) \
+                  + self.hmloss(figure_xr_hidden, figure_ct_hidden_second_hidden) \
+                  + self.hmloss(figure_xr_hidden, figure_ct_random_second_hidden) \
+                  + self.hmloss(figure_ct_random, figure_xr_hidden_second_random) \
                       
         # Visualization step
         if batch_idx == 0:
@@ -255,23 +300,23 @@ class DXRLightningModule(LightningModule):
             viz2d = torch.cat([
                 torch.cat([
                     figure_xr_hidden, 
-                    volume_xr_hidden[..., self.vol_shape // 2, :], 
-                    opaque_xr_hidden[..., self.vol_shape // 2, :], 
+                    volume_xr_hidden_second[..., self.vol_shape // 2, :], 
+                    opaque_xr_hidden_second[..., self.vol_shape // 2, :], 
                     figure_xr_hidden_second_hidden,
                     figure_xr_hidden_second_random,
                 ], dim=-2,).transpose(2, 3),
                 torch.cat([
                     volume_ct_hidden[..., self.vol_shape // 2, :], 
-                    opaque_ct_hidden[..., self.vol_shape // 2, :], 
                     figure_ct_hidden,
                     volume_ct_hidden_second[..., self.vol_shape // 2, :], 
+                    opaque_ct_hidden_second[..., self.vol_shape // 2, :], 
                     figure_ct_hidden_second_hidden,
                 ], dim=-2,).transpose(2, 3),
                 torch.cat([
                     volume_ct_random[..., self.vol_shape // 2, :], 
-                    opaque_ct_random[..., self.vol_shape // 2, :], 
                     figure_ct_random,
                     volume_ct_random_second[..., self.vol_shape // 2, :], 
+                    opaque_ct_random_second[..., self.vol_shape // 2, :], 
                     figure_ct_random_second_random,
                 ], dim=-2,).transpose(2, 3),
             ], dim=-2,)
@@ -282,9 +327,9 @@ class DXRLightningModule(LightningModule):
         # Log the final losses
         self.log(f"{stage}_im2d_loss", im2d_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         self.log(f"{stage}_im3d_loss", im3d_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
-        self.log(f"{stage}_perc_loss", perc_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
+        self.log(f"{stage}_perc_loss", hist_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         
-        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss
+        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * hist_loss
         return loss
     
     def training_step(self, batch, batch_idx, optimizer_idx=None):
