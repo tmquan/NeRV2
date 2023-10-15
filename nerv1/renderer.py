@@ -46,19 +46,19 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
         self.fwd_renderer = fwd_renderer
         assert backbone in backbones.keys()
 
-        self.clarity_net = DiffusionModelUNet(
+        self.net2d3d = DiffusionModelUNet(
             spatial_dims=2,
             in_channels=1,  # Condition with straight/hidden view
             out_channels=self.fov_depth,
             num_channels=backbones[backbone],
             attention_levels=[False, False, False, True, True],
-            norm_num_groups=16,
+            norm_num_groups=8,
             num_res_blocks=2,
             with_conditioning=True,
             cross_attention_dim=12,  # flatR | flatT
         )
         
-        self.density_net = nn.Sequential(
+        self.net3d3d = nn.Sequential(
             Unet(
                 spatial_dims=3, 
                 in_channels=1, 
@@ -69,32 +69,33 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
                 kernel_size=3, 
                 up_kernel_size=3, 
                 act=("LeakyReLU", {"inplace": True}), 
-                norm=Norm.INSTANCE, 
-                # dropout=0.5
+                norm=Norm.BATCH, 
+                dropout=0.5
             )
         )
         
-    def forward(self, image2d, cameras, timesteps=None):
+    def forward(self, image2d, cameras, timesteps=None, resample=True):
         _device = image2d.device
         B = image2d.shape[0]
         
         if timesteps is None:
             timesteps = torch.zeros((B,), device=_device).long()
-
-        viewpts = torch.cat(
-            [
-                cameras.R.reshape(B, 1, -1),
-                cameras.T.reshape(B, 1, -1),
-            ],
-            dim=-1,
-        )
-
-        clarity = self.clarity_net(
+            
+        # print(cameras.R.shape, cameras.T.shape)
+        R = cameras.R
+        T = cameras.T.unsqueeze_(-1) #torch.zeros_like(cameras.T.unsqueeze_(-1))
+        inv = torch.inverse(R)
+        mat = torch.cat([inv, T], dim=-1)
+        mid = self.net2d3d(
             x=image2d,
-            context=viewpts,
+            context=mat.reshape(B, 1, -1),
             timesteps=timesteps,
         ).view(-1, 1, self.fov_depth, self.img_shape, self.img_shape)
 
-        density = self.density_net(clarity)
-        return density, clarity
+        out = self.net3d3d(mid)
+        
+        if resample:
+            grd = F.affine_grid(mat, out.size()).type(out.dtype)
+            out = F.grid_sample(out, grd)
+        return out
         
