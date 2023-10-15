@@ -17,7 +17,7 @@ backbones = {
     "efficientnet-b5": (24, 40, 64, 176, 512),
     "efficientnet-b6": (32, 40, 72, 200, 576),
     "efficientnet-b7": (32, 48, 80, 224, 640),
-    "efficientnet-b8": (32, 56, 88, 248, 704),
+    "efficientnet-b8": (32, 64, 80, 256, 640),
     "efficientnet-l2": (72, 104, 176, 480, 1376),
     "vgg-19": (32, 64, 128, 256, 512),
 }
@@ -46,19 +46,19 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
         self.fwd_renderer = fwd_renderer
         assert backbone in backbones.keys()
 
-        self.net2d3d = DiffusionModelUNet(
+        self.clarity_net = DiffusionModelUNet(
             spatial_dims=2,
             in_channels=1,  # Condition with straight/hidden view
             out_channels=self.fov_depth,
             num_channels=backbones[backbone],
             attention_levels=[False, False, False, True, True],
-            norm_num_groups=8,
+            norm_num_groups=16,
             num_res_blocks=2,
             with_conditioning=True,
             cross_attention_dim=12,  # flatR | flatT
         )
         
-        self.net3d3d = nn.Sequential(
+        self.density_net = nn.Sequential(
             Unet(
                 spatial_dims=3, 
                 in_channels=1, 
@@ -69,8 +69,8 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
                 kernel_size=3, 
                 up_kernel_size=3, 
                 act=("LeakyReLU", {"inplace": True}), 
-                norm=Norm.BATCH, 
-                dropout=0.5
+                norm=Norm.INSTANCE, 
+                # dropout=0.5
             )
         )
         
@@ -83,19 +83,20 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
             
         # print(cameras.R.shape, cameras.T.shape)
         R = cameras.R
-        T = cameras.T.unsqueeze_(-1) #torch.zeros_like(cameras.T.unsqueeze_(-1))
+        # T = cameras.T.unsqueeze_(-1) 
+        T = torch.zeros_like(cameras.T.unsqueeze_(-1))
         inv = torch.inverse(R)
-        mat = torch.cat([inv, T], dim=-1)
-        mid = self.net2d3d(
+        mat = torch.cat([inv, -T], dim=-1)
+        mid = self.clarity_net(
             x=image2d,
             context=mat.reshape(B, 1, -1),
             timesteps=timesteps,
         ).view(-1, 1, self.fov_depth, self.img_shape, self.img_shape)
 
-        out = self.net3d3d(mid)
-        
         if resample:
-            grd = F.affine_grid(mat, out.size()).type(out.dtype)
-            out = F.grid_sample(out, grd)
-        return out
+            grd = F.affine_grid(mat, mid.size()).type(mid.dtype)
+            mid = F.grid_sample(mid, grd)
+            
+        out = self.density_net(mid)
+        return out, mid
         

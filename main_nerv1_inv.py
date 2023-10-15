@@ -149,12 +149,12 @@ class DXRLightningModule(LightningModule):
         self.validation_step_outputs = []
         self.l1loss = nn.L1Loss(reduction="mean")
         # self.hmloss = HistogramMatchingLoss()
-        self.piloss = PerceptualLoss(
-            spatial_dims=2, 
-            network_type="radimagenet_resnet50", 
-            is_fake_3d=False, 
-            pretrained=True
-        )
+        # self.piloss = PerceptualLoss(
+        #     spatial_dims=2, 
+        #     network_type="radimagenet_resnet50", 
+        #     is_fake_3d=False, 
+        #     pretrained=True
+        # )
             
         self.psnr = PeakSignalNoiseRatio(data_range=(0, 1))
         self.ssim = StructuralSimilarityIndexMeasure(data_range=(0, 1))
@@ -167,9 +167,6 @@ class DXRLightningModule(LightningModule):
 
     def forward_volume(self, image2d, cameras, timesteps=None, resample=True):
         return self.inv_renderer(image2d, cameras, timesteps, resample)        
-    
-    def forward_opaque(self, image3d):
-        return self.inv_alpharer(image3d)
         
     def _common_step(self, batch, batch_idx, optimizer_idx, stage: Optional[str] = "evaluation"):
         image3d = batch["image3d"]
@@ -194,13 +191,15 @@ class DXRLightningModule(LightningModule):
         figure_ct = self.forward_screen(torch.cat([volume_ct, volume_ct]),
                                         join_cameras_as_batch([view_hidden, view_random]),
                                         scale=1.0)
-        figure_ct = equalize(figure_ct)
+        # figure_ct = equalize(figure_ct)
         
         figure_ct_hidden, figure_ct_random = torch.split(figure_ct, batchsz)
         figure_dx = torch.cat([figure_xr_hidden, figure_ct_hidden, figure_ct_random])
         
-        volume_dx_second = self.forward_volume(figure_dx, join_cameras_as_batch([view_hidden, view_hidden, view_random]))
+        volume_dx_second, \
+        middle_dx_second = self.forward_volume(figure_dx, join_cameras_as_batch([view_hidden, view_hidden, view_random]))
         volume_xr_hidden_second, volume_ct_hidden_second, volume_ct_random_second = torch.split(volume_dx_second, batchsz)
+        middle_xr_hidden_second, middle_ct_hidden_second, middle_ct_random_second = torch.split(middle_dx_second, batchsz)
         
         figure_dx_second = self.forward_screen(torch.cat([volume_xr_hidden_second,
                                                           volume_xr_hidden_second, 
@@ -229,10 +228,11 @@ class DXRLightningModule(LightningModule):
                   + self.l1loss(figure_ct_random, figure_ct_hidden_second_random) \
                   + self.l1loss(figure_ct_random, figure_ct_random_second_random) 
                       
-        im3d_loss = self.l1loss(volume_ct, volume_ct_hidden_second) + self.l1loss(volume_ct, volume_ct_random_second) 
-        
-        perc_loss = self.piloss(figure_ct_hidden, figure_xr_hidden_second_hidden) \
-                  + self.piloss(figure_ct_random, figure_xr_hidden_second_random) \
+        im3d_loss = self.l1loss(volume_ct, volume_ct_hidden_second) + self.l1loss(volume_ct, middle_ct_hidden_second) \
+                  + self.l1loss(volume_ct, volume_ct_random_second) + self.l1loss(volume_ct, middle_ct_random_second) 
+                  
+        # perc_loss = self.piloss(figure_ct_hidden, figure_xr_hidden_second_hidden) \
+        #           + self.piloss(figure_ct_random, figure_xr_hidden_second_random) \
                                     
         # Visualization step
         if batch_idx == 0:
@@ -244,8 +244,8 @@ class DXRLightningModule(LightningModule):
                     volume_xr_hidden_second[..., self.vol_shape // 2, :], 
                     figure_xr_hidden_second_hidden,
                     figure_xr_hidden_second_random,
-                    figure_ct_hidden_second_hidden, 
-                    figure_ct_hidden_second_random
+                    figure_ct_random_second_hidden, 
+                    figure_ct_random_second_random
                 ], dim=-2,).transpose(2, 3),
                 torch.cat([
                     volume_ct[..., self.vol_shape // 2, :], 
@@ -253,8 +253,8 @@ class DXRLightningModule(LightningModule):
                     figure_ct_random,
                     volume_ct_hidden_second[..., self.vol_shape // 2, :], 
                     volume_ct_random_second[..., self.vol_shape // 2, :], 
-                    figure_ct_random_second_hidden, 
-                    figure_ct_random_second_random
+                    figure_ct_hidden_second_hidden, 
+                    figure_ct_hidden_second_random
                 ], dim=-2,).transpose(2, 3),
             ], dim=-2,)
             tensorboard = self.logger.experiment
@@ -264,9 +264,9 @@ class DXRLightningModule(LightningModule):
         # Log the final losses
         self.log(f"{stage}_im2d_loss", im2d_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         self.log(f"{stage}_im3d_loss", im3d_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
-        self.log(f"{stage}_perc_loss", perc_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
+        # self.log(f"{stage}_perc_loss", perc_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         
-        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss#+ self.theta * hist_loss 
+        loss = self.alpha * im3d_loss + self.gamma * im2d_loss #+ self.lamda * perc_loss#+ self.theta * hist_loss 
         return loss
     
     def training_step(self, batch, batch_idx, optimizer_idx=None):
@@ -401,8 +401,8 @@ if __name__ == "__main__":
         lr_callback,
         checkpoint_callback,
     ]
-    if hparams.strategy != "gan":
-        callbacks.append(swa_callback)
+    # if hparams.strategy != "gan":
+    #     callbacks.append(swa_callback)
     # Init model with callbacks
     trainer = Trainer(
         accelerator=hparams.accelerator,
@@ -410,7 +410,7 @@ if __name__ == "__main__":
         max_epochs=hparams.epochs,
         logger=[tensorboard_logger],
         callbacks=callbacks,
-        accumulate_grad_batches=4,
+        # accumulate_grad_batches=4,
         strategy=hparams.strategy,  # "auto", #"ddp_find_unused_parameters_true",
         precision=16 if hparams.amp else 32,
         profiler="advanced",
