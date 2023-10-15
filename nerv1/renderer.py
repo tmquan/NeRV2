@@ -86,7 +86,7 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
         # T = cameras.T.unsqueeze_(-1) 
         T = torch.zeros_like(cameras.T.unsqueeze_(-1))
         inv = torch.inverse(R)
-        mat = torch.cat([inv, -T], dim=-1)
+        mat = torch.cat([R, -T], dim=-1)
         mid = self.clarity_net(
             x=image2d,
             context=mat.reshape(B, 1, -1),
