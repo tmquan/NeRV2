@@ -25,8 +25,6 @@ from lightning.pytorch.callbacks import StochasticWeightAveraging
 from lightning.pytorch.loggers import TensorBoardLogger
 
 from monai.networks.layers import MedianFilter, BilateralFilter 
-from monai.networks.layers.factories import Norm
-from monai.networks.nets import Unet
 
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -41,8 +39,6 @@ from pytorch3d.renderer.cameras import (
     FoVOrthographicCameras,
     look_at_view_transform,
 )
-
-from kornia.enhance import equalize
 
 from datamodule import UnpairedDataModule
 from dvr.renderer import DirectVolumeFrontToBackRenderer
@@ -78,16 +74,7 @@ def make_cameras_dea(
         return FoVOrthographicCameras(R=R, T=T, znear=znear, zfar=zfar).to(_device)
     return FoVPerspectiveCameras(R=R, T=T, fov=fov, znear=znear, zfar=zfar).to(_device)
 
-class HistogramMatchingLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.l1loss = nn.L1Loss(reduction="mean")
-        self.hmatch = Histogram_Matching(differentiable=True)
-        
-    def forward(self, ref, dst):
-        rst = self.hmatch(dst, ref)
-        return self.l1loss(dst, rst)        
-        
+
 class DXRLightningModule(LightningModule):
     def __init__(self, hparams, **kwargs):
         super().__init__()
@@ -138,42 +125,52 @@ class DXRLightningModule(LightningModule):
             backbone=self.backbone, 
             fwd_renderer=self.fwd_renderer,
         )
-        
+
         if self.ckpt:
-            print("Loading checkpoint...")
             checkpoint = torch.load(self.ckpt, map_location=torch.device("cpu"))["state_dict"]
             state_dict = {k: v for k, v in checkpoint.items() if k in self.state_dict()}
-            self.load_state_dict(state_dict, strict=False)
+            self.load_state_dict(state_dict, strict=self.strict)
 
         self.train_step_outputs = []
         self.validation_step_outputs = []
         self.l1loss = nn.L1Loss(reduction="mean")
-        # self.hmloss = HistogramMatchingLoss()
-        # self.piloss = PerceptualLoss(
-        #     spatial_dims=2, 
-        #     network_type="radimagenet_resnet50", 
-        #     is_fake_3d=False, 
-        #     pretrained=True
-        # )
+        
+        self.piloss = PerceptualLoss(
+            spatial_dims=2, 
+            network_type="radimagenet_resnet50", 
+            is_fake_3d=False, 
+            pretrained=True
+        )
             
         self.psnr = PeakSignalNoiseRatio(data_range=(0, 1))
         self.ssim = StructuralSimilarityIndexMeasure(data_range=(0, 1))
         self.psnr_outputs = []
         self.ssim_outputs = []
     
-    def forward_screen(self, image3d, cameras, opacity=None, norm_type="standardized", scale=0.1):
-        screen = self.fwd_renderer(image3d, cameras, opacity, norm_type, scale) 
+    def forward_screen(self, image3d, cameras):
+        screen = self.fwd_renderer(image3d, cameras) 
         return screen
 
-    def forward_volume(self, image2d, cameras, timesteps=None, resample=True):
-        return self.inv_renderer(image2d, cameras, timesteps, resample)        
+    def forward_volume(self, image2d, cameras, n_views=[2, 1], resample=True, timesteps=None, is_training=False):
+        _device = image2d.device
+        B = image2d.shape[0]
+        assert B == sum(n_views)  # batch must be equal to number of projections
+        results, middles = self.inv_renderer(image2d, cameras, timesteps, resample)
         
+        if is_training:
+            return results, middles
+        return results
+        
+
     def _common_step(self, batch, batch_idx, optimizer_idx, stage: Optional[str] = "evaluation"):
+        pass
+
+    def training_step(self, batch, batch_idx, optimizer_idx=None):
         image3d = batch["image3d"]
         image2d = batch["image2d"]
         _device = batch["image3d"].device
         batchsz = image2d.shape[0]
-
+        
         # Construct the random cameras, -1 and 1 are the same point in azimuths
         dist_random = 6.0 * torch.ones(self.batch_size, device=_device)
         elev_random = torch.rand_like(dist_random) - 0.5
@@ -185,97 +182,188 @@ class DXRLightningModule(LightningModule):
         azim_hidden = torch.zeros(self.batch_size, device=_device)
         view_hidden = make_cameras_dea(dist_hidden, elev_hidden, azim_hidden, fov=18, znear=4, zfar=8)
         
-        # From XR -> image3d -> opacity -> XR
+        # Construct the samples in 2D
         figure_xr_hidden = image2d
-        volume_ct = image3d
-        figure_ct = self.forward_screen(torch.cat([volume_ct, volume_ct]),
-                                        join_cameras_as_batch([view_hidden, view_random]),
-                                        scale=1.0)
-        # figure_ct = equalize(figure_ct)
+        figure_ct_random = self.forward_screen(image3d=image3d, cameras=view_random)
+        figure_ct_hidden = self.forward_screen(image3d=image3d, cameras=view_hidden)
+
+        # train generator
+        # Reconstruct the Encoder-Decoder
+        volume_dx_inverse, \
+        middle_dx_inverse = self.forward_volume(
+            image2d=torch.cat([figure_xr_hidden, figure_ct_random, figure_ct_hidden]), 
+            cameras=join_cameras_as_batch([view_hidden, view_random, view_hidden]), 
+            n_views=[1, 1, 1] * batchsz,
+            is_training=True)
         
-        figure_ct_hidden, figure_ct_random = torch.split(figure_ct, batchsz)
-        figure_dx = torch.cat([figure_xr_hidden, figure_ct_hidden, figure_ct_random])
+        (volume_xr_hidden_inverse, volume_ct_random_inverse, volume_ct_hidden_inverse,) = torch.split(volume_dx_inverse, batchsz)
+        (middle_xr_hidden_inverse, middle_ct_random_inverse, middle_ct_hidden_inverse,) = torch.split(middle_dx_inverse, batchsz)
         
-        volume_dx_second, \
-        middle_dx_second = self.forward_volume(figure_dx, join_cameras_as_batch([view_hidden, view_hidden, view_random]))
-        volume_xr_hidden_second, volume_ct_hidden_second, volume_ct_random_second = torch.split(volume_dx_second, batchsz)
-        middle_xr_hidden_second, middle_ct_hidden_second, middle_ct_random_second = torch.split(middle_dx_second, batchsz)
+        figure_xr_hidden_inverse_random = self.forward_screen(image3d=volume_xr_hidden_inverse, cameras=view_random)
+        figure_xr_hidden_inverse_hidden = self.forward_screen(image3d=volume_xr_hidden_inverse, cameras=view_hidden)
+        figure_ct_random_inverse_random = self.forward_screen(image3d=volume_ct_random_inverse, cameras=view_random)
+        figure_ct_random_inverse_hidden = self.forward_screen(image3d=volume_ct_random_inverse, cameras=view_hidden)
+        figure_ct_hidden_inverse_random = self.forward_screen(image3d=volume_ct_hidden_inverse, cameras=view_random)
+        figure_ct_hidden_inverse_hidden = self.forward_screen(image3d=volume_ct_hidden_inverse, cameras=view_hidden)
+
+        if self.sh > 0:
+            volume_xr_hidden_inverse = volume_xr_hidden_inverse.sum(dim=1, keepdim=True)
+            volume_ct_random_inverse = volume_ct_random_inverse.sum(dim=1, keepdim=True)
+            volume_ct_hidden_inverse = volume_ct_hidden_inverse.sum(dim=1, keepdim=True)
+
+        im2d_loss_inv = (
+            self.l1loss(figure_xr_hidden_inverse_hidden, figure_xr_hidden)
+            + self.l1loss(figure_ct_random_inverse_random, figure_ct_random)
+            + self.l1loss(figure_ct_random_inverse_hidden, figure_ct_hidden)
+            + self.l1loss(figure_ct_hidden_inverse_random, figure_ct_random) * self.omega
+            + self.l1loss(figure_ct_hidden_inverse_hidden, figure_ct_hidden) * self.omega
+        )
+
+        im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) \
+                      + self.l1loss(volume_ct_random_inverse, image3d) \
+                      + self.l1loss(middle_ct_hidden_inverse, image3d) \
+                      + self.l1loss(middle_ct_random_inverse, image3d)
+
+        im2d_loss = im2d_loss_inv
+        im3d_loss = im3d_loss_inv
+        perc_loss = self.piloss(figure_xr_hidden_inverse_random, figure_ct_random)     
         
-        figure_dx_second = self.forward_screen(torch.cat([volume_xr_hidden_second,
-                                                          volume_xr_hidden_second, 
-                                                          volume_ct_hidden_second, 
-                                                          volume_ct_hidden_second, 
-                                                          volume_ct_random_second,
-                                                          volume_ct_random_second]), 
-                                               join_cameras_as_batch([view_hidden, 
-                                                                      view_random, 
-                                                                      view_hidden, 
-                                                                      view_random, 
-                                                                      view_hidden, 
-                                                                      view_random]), 
-                                               scale=1.0)
+        # Log the final losses
+        self.log(f"train_im2d_loss", im2d_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
+        self.log(f"train_im3d_loss", im3d_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
+        self.log(f"train_perc_loss", perc_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         
-        figure_xr_hidden_second_hidden, \
-        figure_xr_hidden_second_random, \
-        figure_ct_hidden_second_hidden, \
-        figure_ct_hidden_second_random, \
-        figure_ct_random_second_hidden, \
-        figure_ct_random_second_random = torch.split(figure_dx_second, batchsz)
+        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss
         
-        im2d_loss = self.l1loss(figure_xr_hidden, figure_xr_hidden_second_hidden) \
-                  + self.l1loss(figure_ct_hidden, figure_ct_hidden_second_hidden) \
-                  + self.l1loss(figure_ct_hidden, figure_ct_random_second_hidden) \
-                  + self.l1loss(figure_ct_random, figure_ct_hidden_second_random) \
-                  + self.l1loss(figure_ct_random, figure_ct_random_second_random) 
-                      
-        im3d_loss = self.l1loss(volume_ct, volume_ct_hidden_second) + self.l1loss(volume_ct, middle_ct_hidden_second) \
-                  + self.l1loss(volume_ct, volume_ct_random_second) + self.l1loss(volume_ct, middle_ct_random_second) 
-                  
-        # perc_loss = self.piloss(figure_ct_hidden, figure_xr_hidden_second_hidden) \
-        #           + self.piloss(figure_ct_random, figure_xr_hidden_second_random) \
-                                    
         # Visualization step
         if batch_idx == 0:
             zeros = torch.zeros_like(image2d)
             viz2d = torch.cat([
                 torch.cat([
-                    zeros,
-                    figure_xr_hidden, 
-                    volume_xr_hidden_second[..., self.vol_shape // 2, :], 
-                    figure_xr_hidden_second_hidden,
-                    figure_xr_hidden_second_random,
-                    figure_ct_random_second_hidden, 
-                    figure_ct_random_second_random
+                    image2d, 
+                    volume_xr_hidden_inverse[..., self.vol_shape // 2, :], 
+                    figure_xr_hidden_inverse_random, 
+                    figure_xr_hidden_inverse_hidden, 
+                    image3d[..., self.vol_shape // 2, :], 
+                    figure_ct_random, 
+                    figure_ct_hidden,
                 ], dim=-2,).transpose(2, 3),
                 torch.cat([
-                    volume_ct[..., self.vol_shape // 2, :], 
-                    figure_ct_hidden,
-                    figure_ct_random,
-                    volume_ct_hidden_second[..., self.vol_shape // 2, :], 
-                    volume_ct_random_second[..., self.vol_shape // 2, :], 
-                    figure_ct_hidden_second_hidden, 
-                    figure_ct_hidden_second_random
+                    zeros,
+                    # zeros,
+                    # zeros,
+                    # zeros,
+                    # volume_xr_sample_hidden[..., self.vol_shape // 2, :],
+                    # figure_xr_sample_hidden_random,
+                    # figure_xr_sample_hidden_hidden,
+                    volume_ct_random_inverse[..., self.vol_shape // 2, :],
+                    figure_ct_random_inverse_random,
+                    figure_ct_random_inverse_hidden,
+                    volume_ct_hidden_inverse[..., self.vol_shape // 2, :],
+                    figure_ct_hidden_inverse_random,
+                    figure_ct_hidden_inverse_hidden,
                 ], dim=-2,).transpose(2, 3),
             ], dim=-2,)
             tensorboard = self.logger.experiment
             grid2d = torchvision.utils.make_grid(viz2d, normalize=False, scale_each=False, nrow=1, padding=0).clamp(0.0, 1.0)  
-            tensorboard.add_image(f"{stage}_df_samples", grid2d, self.current_epoch * self.batch_size + batch_idx,)
-                      
-        # Log the final losses
-        self.log(f"{stage}_im2d_loss", im2d_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
-        self.log(f"{stage}_im3d_loss", im3d_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
-        # self.log(f"{stage}_perc_loss", perc_loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
+            tensorboard.add_image(f"train_df_samples", grid2d, self.current_epoch * self.batch_size + batch_idx,)
         
-        loss = self.alpha * im3d_loss + self.gamma * im2d_loss #+ self.lamda * perc_loss#+ self.theta * hist_loss 
-        return loss
-    
-    def training_step(self, batch, batch_idx, optimizer_idx=None):
-        loss = self._common_step(batch, batch_idx, optimizer_idx, stage="train")
         self.train_step_outputs.append(loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss = self._common_step(batch, batch_idx, optimizer_idx=-1, stage="validation")
+        image3d = batch["image3d"]
+        image2d = batch["image2d"]
+        _device = batch["image3d"].device
+        batchsz = image2d.shape[0]
+        
+        # Construct the random cameras, -1 and 1 are the same point in azimuths
+        dist_random = 6.0 * torch.ones(self.batch_size, device=_device)
+        elev_random = torch.rand_like(dist_random) - 0.5
+        azim_random = torch.rand_like(dist_random) * 2 - 1  # [0 1) to [-1 1)
+        view_random = make_cameras_dea(dist_random, elev_random, azim_random, fov=18, znear=4, zfar=8)
+
+        dist_hidden = 6.0 * torch.ones(self.batch_size, device=_device)
+        elev_hidden = torch.zeros(self.batch_size, device=_device)
+        azim_hidden = torch.zeros(self.batch_size, device=_device)
+        view_hidden = make_cameras_dea(dist_hidden, elev_hidden, azim_hidden, fov=18, znear=4, zfar=8)
+        
+        # Construct the samples in 2D
+        figure_xr_hidden = image2d
+        figure_ct_random = self.forward_screen(image3d=image3d, cameras=view_random)
+        figure_ct_hidden = self.forward_screen(image3d=image3d, cameras=view_hidden)
+
+        # Reconstruct the Encoder-Decoder
+        volume_dx_inverse = self.forward_volume(
+            image2d=torch.cat([figure_xr_hidden, figure_ct_random, figure_ct_hidden]), 
+            cameras=join_cameras_as_batch([view_hidden, view_random, view_hidden]), 
+            n_views=[1, 1, 1] * batchsz, is_training=False)
+        (volume_xr_hidden_inverse, volume_ct_random_inverse, volume_ct_hidden_inverse,) = torch.split(volume_dx_inverse, batchsz)
+        
+        figure_xr_hidden_inverse_random = self.forward_screen(image3d=volume_xr_hidden_inverse, cameras=view_random)
+        figure_xr_hidden_inverse_hidden = self.forward_screen(image3d=volume_xr_hidden_inverse, cameras=view_hidden)
+        figure_ct_random_inverse_random = self.forward_screen(image3d=volume_ct_random_inverse, cameras=view_random)
+        figure_ct_random_inverse_hidden = self.forward_screen(image3d=volume_ct_random_inverse, cameras=view_hidden)
+        figure_ct_hidden_inverse_random = self.forward_screen(image3d=volume_ct_hidden_inverse, cameras=view_random)
+        figure_ct_hidden_inverse_hidden = self.forward_screen(image3d=volume_ct_hidden_inverse, cameras=view_hidden)
+
+        if self.sh > 0:
+            volume_xr_hidden_inverse = volume_xr_hidden_inverse.sum(dim=1, keepdim=True)
+            volume_ct_random_inverse = volume_ct_random_inverse.sum(dim=1, keepdim=True)
+            volume_ct_hidden_inverse = volume_ct_hidden_inverse.sum(dim=1, keepdim=True)
+
+        im2d_loss_inv = (
+            self.l1loss(figure_xr_hidden_inverse_hidden, figure_xr_hidden)
+            + self.l1loss(figure_ct_random_inverse_random, figure_ct_random)
+            + self.l1loss(figure_ct_random_inverse_hidden, figure_ct_hidden)
+            + self.l1loss(figure_ct_hidden_inverse_random, figure_ct_random) * self.omega
+            + self.l1loss(figure_ct_hidden_inverse_hidden, figure_ct_hidden) * self.omega
+        )
+
+        im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) + self.l1loss(volume_ct_random_inverse, image3d)
+
+        im2d_loss = im2d_loss_inv
+        im3d_loss = im3d_loss_inv
+
+        # Log the final losses
+        self.log(f"validation_im2d_loss", im2d_loss, on_step=False, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
+        self.log(f"validation_im3d_loss", im3d_loss, on_step=False, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
+
+        # Visualization step
+        if batch_idx == 0:
+            zeros = torch.zeros_like(image2d)
+            viz2d = torch.cat([
+                torch.cat([
+                    image2d, 
+                    volume_xr_hidden_inverse[..., self.vol_shape // 2, :], 
+                    figure_xr_hidden_inverse_random, 
+                    figure_xr_hidden_inverse_hidden, 
+                    image3d[..., self.vol_shape // 2, :], 
+                    figure_ct_random, 
+                    figure_ct_hidden,
+                ], dim=-2,).transpose(2, 3),
+                torch.cat([
+                    zeros,
+                    # zeros,
+                    # zeros,
+                    # zeros,
+                    # volume_xr_sample_hidden[..., self.vol_shape // 2, :],
+                    # figure_xr_sample_hidden_random,
+                    # figure_xr_sample_hidden_hidden,
+                    volume_ct_random_inverse[..., self.vol_shape // 2, :],
+                    figure_ct_random_inverse_random,
+                    figure_ct_random_inverse_hidden,
+                    volume_ct_hidden_inverse[..., self.vol_shape // 2, :],
+                    figure_ct_hidden_inverse_random,
+                    figure_ct_hidden_inverse_hidden,
+                ], dim=-2,).transpose(2, 3),
+            ], dim=-2,)
+            tensorboard = self.logger.experiment
+            grid2d = torchvision.utils.make_grid(viz2d, normalize=False, scale_each=False, nrow=1, padding=0).clamp(0.0, 1.0) 
+            tensorboard.add_image(f"validation_df_samples", grid2d, self.current_epoch * self.batch_size + batch_idx,)
+        
+        
+        loss = self.alpha * im3d_loss + self.gamma * im2d_loss
         self.validation_step_outputs.append(loss)
         return loss
 
@@ -292,12 +380,11 @@ class DXRLightningModule(LightningModule):
         view_hidden = make_cameras_dea(dist_hidden, elev_hidden, azim_hidden, fov=18, znear=4, zfar=8)
 
         # Construct the samples in 2D
-        # figure_ct_hidden = self.forward_screen(image3d=image3d, cameras=view_hidden)
-        # figure_xr_hidden = image2d
+        figure_ct_hidden = self.forward_screen(image3d=image3d, cameras=view_hidden)
+        figure_xr_hidden = image2d
 
-        # secondstruct the Encoder-Decoder
-        # volume_ct_hidden = self.forward_volume(image2d=figure_ct_hidden)
-        
+        # Reconstruct the Encoder-Decoder
+        volume_ct_hidden = self.forward_volume(image2d=figure_ct_hidden, is_training=False)
         psnr = self.psnr(volume_ct_hidden, image3d)
         ssim = self.ssim(volume_ct_hidden, image3d)
         self.psnr_outputs.append(psnr)
@@ -323,7 +410,7 @@ class DXRLightningModule(LightningModule):
         optimizer = torch.optim.AdamW(
             [
                 {"params": self.inv_renderer.parameters()},
-                # {'params': self.inv_alpharer.parameters()}, # Add 
+                # {'params': self.unet2d_model.parameters()}, # Add diffusion model, remove lpips model
             ],
             lr=self.lr,
             betas=(0.5, 0.999)
@@ -401,8 +488,8 @@ if __name__ == "__main__":
         lr_callback,
         checkpoint_callback,
     ]
-    # if hparams.strategy != "gan":
-    #     callbacks.append(swa_callback)
+    if hparams.strategy != "gan":
+        callbacks.append(swa_callback)
     # Init model with callbacks
     trainer = Trainer(
         accelerator=hparams.accelerator,
@@ -410,7 +497,7 @@ if __name__ == "__main__":
         max_epochs=hparams.epochs,
         logger=[tensorboard_logger],
         callbacks=callbacks,
-        # accumulate_grad_batches=4,
+        accumulate_grad_batches=4,
         strategy=hparams.strategy,  # "auto", #"ddp_find_unused_parameters_true",
         precision=16 if hparams.amp else 32,
         profiler="advanced",

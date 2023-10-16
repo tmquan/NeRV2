@@ -70,7 +70,7 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
                 up_kernel_size=3, 
                 act=("LeakyReLU", {"inplace": True}), 
                 norm=Norm.INSTANCE, 
-                # dropout=0.5
+                dropout=0.5
             )
         )
         
