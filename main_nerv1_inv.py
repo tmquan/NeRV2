@@ -226,7 +226,7 @@ class DXRLightningModule(LightningModule):
 
         im2d_loss = im2d_loss_inv
         im3d_loss = im3d_loss_inv
-        perc_loss = self.piloss(figure_xr_hidden_inverse_random, figure_ct_random)     
+        perc_loss = self.piloss(figure_xr_hidden_inverse_random.float(), figure_ct_random.float())
         
         # Log the final losses
         self.log(f"train_im2d_loss", im2d_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)

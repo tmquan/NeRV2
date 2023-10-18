@@ -85,7 +85,8 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
         R = cameras.R
         # T = cameras.T.unsqueeze_(-1) 
         T = torch.zeros_like(cameras.T.unsqueeze_(-1))
-        inv = torch.inverse(R)
+        # inv = torch.inverse(R)
+        
         mat = torch.cat([R, -T], dim=-1)
         mid = self.clarity_net(
             x=image2d,
@@ -93,6 +94,7 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
             timesteps=timesteps,
         ).view(-1, 1, self.fov_depth, self.img_shape, self.img_shape)
 
+        mat = torch.cat([torch.inverse(R), -T], dim=-1)
         if resample:
             grd = F.affine_grid(mat, mid.size()).type(mid.dtype)
             mid = F.grid_sample(mid, grd)
