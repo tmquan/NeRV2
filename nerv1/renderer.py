@@ -69,17 +69,17 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
                 kernel_size=3, 
                 up_kernel_size=3, 
                 act=("LeakyReLU", {"inplace": True}), 
-                norm=Norm.INSTANCE, 
+                norm=Norm.BATCH, 
                 dropout=0.5
             )
         )
         
     def forward(self, image2d, cameras, timesteps=None, resample=True):
         _device = image2d.device
-        B = image2d.shape[0]
-        
+        batch = image2d.shape[0]
+        dtype = image2d.dtype
         if timesteps is None:
-            timesteps = torch.zeros((B,), device=_device).long()
+            timesteps = torch.zeros((batch,), device=_device).long()
             
         # print(cameras.R.shape, cameras.T.shape)
         R = cameras.R
@@ -90,15 +90,30 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
         mat = torch.cat([R, -T], dim=-1)
         mid = self.clarity_net(
             x=image2d,
-            context=mat.reshape(B, 1, -1),
+            context=mat.reshape(batch, 1, -1),
             timesteps=timesteps,
         ).view(-1, 1, self.fov_depth, self.img_shape, self.img_shape)
 
         mat = torch.cat([torch.inverse(R), -T], dim=-1)
-        if resample:
-            grd = F.affine_grid(mat, mid.size()).type(mid.dtype)
-            mid = F.grid_sample(mid, grd)
-            
-        out = self.density_net(mid)
+        grd = F.affine_grid(mat, mid.size()).type(dtype)
+        
+        # Define functions to calculate 'mid_resample' and 'out_resample'
+        def calculate_resample_operations():
+            mid_resample = F.grid_sample(mid, grd)
+            out_resample = self.density_net(mid_resample)
+            return out_resample, mid_resample
+
+        # Define functions to calculate 'mid_explicit' and 'out_explicit'
+        def calculate_explicit_operations():
+            out = self.density_net(mid)
+            mid_explicit = F.grid_sample(mid, grd)
+            out_explicit = F.grid_sample(out, grd)
+            return out_explicit, mid_explicit
+
+        # Use torch.where to conditionally calculate operations based on 'resample'
+        out, mid = torch.where(resample.unsqueeze(-1), 
+                               calculate_resample_operations(), 
+                               calculate_explicit_operations())
+
         return out, mid
         

@@ -156,7 +156,6 @@ class DXRLightningModule(LightningModule):
         B = image2d.shape[0]
         assert B == sum(n_views)  # batch must be equal to number of projections
         results, middles = self.inv_renderer(image2d, cameras, timesteps, resample)
-        
         if is_training:
             return results, middles
         return results
@@ -193,7 +192,9 @@ class DXRLightningModule(LightningModule):
         middle_dx_inverse = self.forward_volume(
             image2d=torch.cat([figure_xr_hidden, figure_ct_random, figure_ct_hidden]), 
             cameras=join_cameras_as_batch([view_hidden, view_random, view_hidden]), 
-            n_views=[1, 1, 1] * batchsz,
+            n_views=[1, 1, 1] * batchsz, 
+            resample=torch.randint(low=0, high=2, size=batchsz),
+            timesteps=None,
             is_training=True)
         
         (volume_xr_hidden_inverse, volume_ct_random_inverse, volume_ct_hidden_inverse,) = torch.split(volume_dx_inverse, batchsz)
@@ -250,12 +251,6 @@ class DXRLightningModule(LightningModule):
                 ], dim=-2,).transpose(2, 3),
                 torch.cat([
                     zeros,
-                    # zeros,
-                    # zeros,
-                    # zeros,
-                    # volume_xr_sample_hidden[..., self.vol_shape // 2, :],
-                    # figure_xr_sample_hidden_random,
-                    # figure_xr_sample_hidden_hidden,
                     volume_ct_random_inverse[..., self.vol_shape // 2, :],
                     figure_ct_random_inverse_random,
                     figure_ct_random_inverse_hidden,
@@ -297,7 +292,10 @@ class DXRLightningModule(LightningModule):
         volume_dx_inverse = self.forward_volume(
             image2d=torch.cat([figure_xr_hidden, figure_ct_random, figure_ct_hidden]), 
             cameras=join_cameras_as_batch([view_hidden, view_random, view_hidden]), 
-            n_views=[1, 1, 1] * batchsz, is_training=False)
+            n_views=[1, 1, 1] * batchsz, 
+            resample=[True] * batchsz,
+            timesteps=None,
+            is_training=False)
         (volume_xr_hidden_inverse, volume_ct_random_inverse, volume_ct_hidden_inverse,) = torch.split(volume_dx_inverse, batchsz)
         
         figure_xr_hidden_inverse_random = self.forward_screen(image3d=volume_xr_hidden_inverse, cameras=view_random)
@@ -344,12 +342,6 @@ class DXRLightningModule(LightningModule):
                 ], dim=-2,).transpose(2, 3),
                 torch.cat([
                     zeros,
-                    # zeros,
-                    # zeros,
-                    # zeros,
-                    # volume_xr_sample_hidden[..., self.vol_shape // 2, :],
-                    # figure_xr_sample_hidden_random,
-                    # figure_xr_sample_hidden_hidden,
                     volume_ct_random_inverse[..., self.vol_shape // 2, :],
                     figure_ct_random_inverse_random,
                     figure_ct_random_inverse_hidden,
@@ -384,7 +376,7 @@ class DXRLightningModule(LightningModule):
         figure_xr_hidden = image2d
 
         # Reconstruct the Encoder-Decoder
-        volume_ct_hidden = self.forward_volume(image2d=figure_ct_hidden, is_training=False)
+        volume_ct_hidden = self.forward_volume(image2d=figure_ct_hidden, is_training=False, resample=[True] * batchsz)
         psnr = self.psnr(volume_ct_hidden, image3d)
         ssim = self.ssim(volume_ct_hidden, image3d)
         self.psnr_outputs.append(psnr)
