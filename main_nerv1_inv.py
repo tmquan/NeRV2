@@ -174,8 +174,7 @@ class DXRLightningModule(LightningModule):
 
         # train generator
         # Reconstruct the Encoder-Decoder
-        volume_dx_inverse, \
-        middle_dx_inverse = self.forward_volume(
+        volume_dx_inverse = self.forward_volume(
             image2d=torch.cat([figure_xr_hidden, figure_ct_random, figure_ct_hidden]), 
             cameras=join_cameras_as_batch([view_hidden, view_random, view_hidden]), 
             n_views=[1, 1, 1] * batchsz, 
@@ -184,7 +183,6 @@ class DXRLightningModule(LightningModule):
             has_middle=False)
         
         (volume_xr_hidden_inverse, volume_ct_random_inverse, volume_ct_hidden_inverse,) = torch.split(volume_dx_inverse, batchsz)
-        (middle_xr_hidden_inverse, middle_ct_random_inverse, middle_ct_hidden_inverse,) = torch.split(middle_dx_inverse, batchsz)
         
         figure_xr_hidden_inverse_random = self.forward_screen(image3d=volume_xr_hidden_inverse, cameras=view_random)
         figure_xr_hidden_inverse_hidden = self.forward_screen(image3d=volume_xr_hidden_inverse, cameras=view_hidden)
