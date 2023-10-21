@@ -17,9 +17,8 @@ backbones = {
     "efficientnet-b5": (24, 40, 64, 176, 512),
     "efficientnet-b6": (32, 40, 72, 200, 576),
     "efficientnet-b7": (32, 48, 80, 224, 640),
-    "efficientnet-b8": (32, 64, 80, 256, 640),
+    "efficientnet-b8": (32, 56, 88, 248, 704),
     "efficientnet-l2": (72, 104, 176, 480, 1376),
-    "vgg-19": (32, 64, 128, 256, 512),
 }
 
 class NeRVFrontToBackInverseRenderer(nn.Module):
@@ -52,7 +51,7 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
             out_channels=self.fov_depth,
             num_channels=backbones[backbone],
             attention_levels=[False, False, False, True, True],
-            norm_num_groups=16,
+            norm_num_groups=8,
             num_res_blocks=2,
             with_conditioning=True,
             cross_attention_dim=12,  # flatR | flatT
@@ -74,18 +73,15 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
             )
         )
         
-    def forward(self, image2d, cameras, timesteps=None, resample=True):
+    def forward(self, image2d, cameras, timesteps=None, resample=True, is_training=False):
         _device = image2d.device
         batch = image2d.shape[0]
         dtype = image2d.dtype
         if timesteps is None:
             timesteps = torch.zeros((batch,), device=_device).long()
-            
-        # print(cameras.R.shape, cameras.T.shape)
+        
         R = cameras.R
-        # T = cameras.T.unsqueeze_(-1) 
         T = torch.zeros_like(cameras.T.unsqueeze_(-1))
-        # inv = torch.inverse(R)
         
         mat = torch.cat([R, -T], dim=-1)
         mid = self.clarity_net(
@@ -97,23 +93,21 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
         mat = torch.cat([torch.inverse(R), -T], dim=-1)
         grd = F.affine_grid(mat, mid.size()).type(dtype)
         
-        # Define functions to calculate 'mid_resample' and 'out_resample'
-        def calculate_resample_operations():
-            mid_resample = F.grid_sample(mid, grd)
-            out_resample = self.density_net(mid_resample)
-            return out_resample, mid_resample
-
-        # Define functions to calculate 'mid_explicit' and 'out_explicit'
-        def calculate_explicit_operations():
-            out = self.density_net(mid)
-            mid_explicit = F.grid_sample(mid, grd)
-            out_explicit = F.grid_sample(out, grd)
-            return out_explicit, mid_explicit
-
-        # Use torch.where to conditionally calculate operations based on 'resample'
-        out, mid = torch.where(resample.unsqueeze(-1), 
-                               calculate_resample_operations(), 
-                               calculate_explicit_operations())
-
-        return out, mid
+        mid_resample = F.grid_sample(mid, grd)
+        out_resample = self.density_net(mid_resample)
+        out = self.density_net(mid)
+        mid_explicit = F.grid_sample(mid, grd)
+        out_explicit = F.grid_sample(out, grd)
         
+        if is_training:
+            # Randomly return out_resample or out_explicit
+            rng = torch.rand(1).item()
+            if rng > 0.5:
+                out = out_resample
+            else:
+                out = out_explicit
+            mid = mid_resample
+            return out, mid
+        else:
+            # Return out_resample for inference
+            return out_resample, mid_resample

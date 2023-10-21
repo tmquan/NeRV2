@@ -44,20 +44,6 @@ from datamodule import UnpairedDataModule
 from dvr.renderer import DirectVolumeFrontToBackRenderer
 from nerv1.renderer import NeRVFrontToBackInverseRenderer
 
-backbones = {
-    "efficientnet-b0": (16, 24, 40, 112, 320),
-    "efficientnet-b1": (16, 24, 40, 112, 320),
-    "efficientnet-b2": (16, 24, 48, 120, 352),
-    "efficientnet-b3": (24, 32, 48, 136, 384),
-    "efficientnet-b4": (24, 32, 56, 160, 448),
-    "efficientnet-b5": (24, 40, 64, 176, 512),
-    "efficientnet-b6": (32, 40, 72, 200, 576),
-    "efficientnet-b7": (32, 48, 80, 224, 640),
-    "efficientnet-b8": (32, 56, 88, 248, 704),
-    "efficientnet-l2": (72, 104, 176, 480, 1376),
-}
-
-
 def make_cameras_dea(
     dist: torch.Tensor, 
     elev: torch.Tensor, 
@@ -151,12 +137,12 @@ class DXRLightningModule(LightningModule):
         screen = self.fwd_renderer(image3d, cameras) 
         return screen
 
-    def forward_volume(self, image2d, cameras, n_views=[2, 1], resample=True, timesteps=None, is_training=False):
+    def forward_volume(self, image2d, cameras, n_views=[2, 1], resample=True, timesteps=None, has_middle=False):
         _device = image2d.device
         B = image2d.shape[0]
         assert B == sum(n_views)  # batch must be equal to number of projections
         results, middles = self.inv_renderer(image2d, cameras, timesteps, resample)
-        if is_training:
+        if has_middle:
             return results, middles
         return results
         
@@ -193,9 +179,9 @@ class DXRLightningModule(LightningModule):
             image2d=torch.cat([figure_xr_hidden, figure_ct_random, figure_ct_hidden]), 
             cameras=join_cameras_as_batch([view_hidden, view_random, view_hidden]), 
             n_views=[1, 1, 1] * batchsz, 
-            resample=torch.randint(low=0, high=2, size=batchsz),
+            resample=torch.randint(low=0, high=2, size=(3*batchsz,)),
             timesteps=None,
-            is_training=True)
+            has_middle=False)
         
         (volume_xr_hidden_inverse, volume_ct_random_inverse, volume_ct_hidden_inverse,) = torch.split(volume_dx_inverse, batchsz)
         (middle_xr_hidden_inverse, middle_ct_random_inverse, middle_ct_hidden_inverse,) = torch.split(middle_dx_inverse, batchsz)
@@ -221,9 +207,7 @@ class DXRLightningModule(LightningModule):
         )
 
         im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) \
-                      + self.l1loss(volume_ct_random_inverse, image3d) \
-                      + self.l1loss(middle_ct_hidden_inverse, image3d) \
-                      + self.l1loss(middle_ct_random_inverse, image3d)
+                      + self.l1loss(volume_ct_random_inverse, image3d) 
 
         im2d_loss = im2d_loss_inv
         im3d_loss = im3d_loss_inv
@@ -293,9 +277,9 @@ class DXRLightningModule(LightningModule):
             image2d=torch.cat([figure_xr_hidden, figure_ct_random, figure_ct_hidden]), 
             cameras=join_cameras_as_batch([view_hidden, view_random, view_hidden]), 
             n_views=[1, 1, 1] * batchsz, 
-            resample=[True] * batchsz,
+            resample=torch.ones(batchsz,),
             timesteps=None,
-            is_training=False)
+            has_middle=False)
         (volume_xr_hidden_inverse, volume_ct_random_inverse, volume_ct_hidden_inverse,) = torch.split(volume_dx_inverse, batchsz)
         
         figure_xr_hidden_inverse_random = self.forward_screen(image3d=volume_xr_hidden_inverse, cameras=view_random)
@@ -376,7 +360,7 @@ class DXRLightningModule(LightningModule):
         figure_xr_hidden = image2d
 
         # Reconstruct the Encoder-Decoder
-        volume_ct_hidden = self.forward_volume(image2d=figure_ct_hidden, is_training=False, resample=[True] * batchsz)
+        volume_ct_hidden = self.forward_volume(image2d=figure_ct_hidden, has_middle=False, resample=torch.ones(batchsz,))
         psnr = self.psnr(volume_ct_hidden, image3d)
         ssim = self.ssim(volume_ct_hidden, image3d)
         self.psnr_outputs.append(psnr)
