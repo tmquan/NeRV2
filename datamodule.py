@@ -158,7 +158,7 @@ class UnpairedDataModule(LightningDataModule):
                         ScaleIntensityRangeDict(keys=["image3d"], clip=True, a_min=-500, a_max=3071, b_min=0.0, b_max=1.0,),  # Full range  # -200,  # 1500,
                     ]
                 ),
-                RandRotateDict(keys=["image3d"], prob=1.0, range_x=0.1, padding_mode="zeros", mode=["bilinear"], align_corners=True,),
+                RandRotateDict(keys=["image3d"], prob=1.0, range_x=0.1, range_y=0.1, range_z=0.1, padding_mode="zeros", mode=["bilinear"], align_corners=True,),
                 RandZoomDict(keys=["image3d"], prob=1.0, min_zoom=0.85, max_zoom=1.10, padding_mode="constant", mode=["trilinear"], align_corners=True,),
                 RandZoomDict(keys=["image2d"], prob=1.0, min_zoom=0.85, max_zoom=1.10, padding_mode="constant", mode=["area"],),
                 CropForegroundDict(keys=["image3d"], source_key="image3d", select_fn=(lambda x: x > 0), margin=0,),
