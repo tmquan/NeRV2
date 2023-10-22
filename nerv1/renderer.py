@@ -18,6 +18,7 @@ backbones = {
     "efficientnet-b6": (32, 40, 72, 200, 576),
     "efficientnet-b7": (32, 48, 80, 224, 640),
     "efficientnet-b8": (32, 56, 88, 248, 704),
+    "efficientnet-b9": (32, 64, 96, 256, 800),
     "efficientnet-l2": (72, 104, 176, 480, 1376),
 }
 
