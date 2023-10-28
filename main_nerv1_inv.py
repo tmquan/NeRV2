@@ -24,12 +24,11 @@ from lightning.pytorch.callbacks import LearningRateMonitor
 from lightning.pytorch.callbacks import StochasticWeightAveraging
 from lightning.pytorch.loggers import TensorBoardLogger
 
-from monai.networks.layers import MedianFilter, BilateralFilter 
+# from monai.networks.layers import MedianFilter, BilateralFilter 
+from monai.losses import PerceptualLoss
 
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
-
-from generative.losses import PerceptualLoss
 
 from argparse import ArgumentParser
 
@@ -123,9 +122,11 @@ class DXRLightningModule(LightningModule):
         
         self.piloss = PerceptualLoss(
             spatial_dims=2, 
-            network_type="radimagenet_resnet50", 
+            network_type="resnet50", 
+            # network_type="radimagenet_resnet50", 
+            # network_type="medicalnet_resnet50_23datasets", 
             is_fake_3d=False, 
-            pretrained=True
+            pretrained=True,
         )
             
         self.psnr = PeakSignalNoiseRatio(data_range=(0, 1))
@@ -155,7 +156,7 @@ class DXRLightningModule(LightningModule):
         image2d = batch["image2d"]
         _device = batch["image3d"].device
         batchsz = image2d.shape[0]
-        
+              
         # Construct the random cameras, -1 and 1 are the same point in azimuths
         dist_random = 6.0 * torch.ones(self.batch_size, device=_device)
         elev_random = torch.rand_like(dist_random) - 0.5
@@ -206,19 +207,24 @@ class DXRLightningModule(LightningModule):
             + self.l1loss(figure_ct_hidden_inverse_hidden, figure_ct_hidden) * self.omega
         )
 
-        im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) + self.l1loss(volume_ct_random_inverse, image3d) \
-                      + self.l1loss(middle_ct_hidden_inverse, image3d) + self.l1loss(middle_ct_random_inverse, image3d)   
-
+        im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) + self.l1loss(volume_ct_random_inverse, image3d)
+        if self.current_epoch>10:
+            im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) + self.l1loss(volume_ct_random_inverse, image3d) \
+                          + self.l1loss(middle_ct_hidden_inverse, image3d) + self.l1loss(middle_ct_random_inverse, image3d)   
+            
         im2d_loss = im2d_loss_inv
         im3d_loss = im3d_loss_inv
-        perc_loss = self.piloss(figure_xr_hidden_inverse_random.float(), figure_ct_random.float())
+        # perc_loss = self.piloss(figure_xr_hidden_inverse_random.float(), figure_ct_random.float())
+        perc_loss = self.piloss(figure_xr_hidden_inverse_random.float(), figure_ct_hidden_inverse_random.float())
+        # perc_loss = self.piloss(image3d.float(), volume_xr_hidden_inverse.float())
         
         # Log the final losses
         self.log(f"train_im2d_loss", im2d_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         self.log(f"train_im3d_loss", im3d_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         self.log(f"train_perc_loss", perc_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         
-        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + (im2d_loss * im3d_loss) * perc_loss
+        # loss = self.alpha * im3d_loss + self.gamma * im2d_loss + (im2d_loss * im3d_loss) * perc_loss
+        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss
         
         # Visualization step
         if batch_idx == 0:
@@ -255,7 +261,7 @@ class DXRLightningModule(LightningModule):
         image2d = batch["image2d"]
         _device = batch["image3d"].device
         batchsz = image2d.shape[0]
-        
+                  
         # Construct the random cameras, -1 and 1 are the same point in azimuths
         dist_random = 6.0 * torch.ones(self.batch_size, device=_device)
         elev_random = torch.rand_like(dist_random) - 0.5
