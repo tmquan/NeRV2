@@ -177,7 +177,7 @@ class DXRLightningModule(LightningModule):
         if has_middle:
             return results, middles
         # print(results.shape)
-        return results
+        return 0.5*(results + middles)
     
     def forward_timing(self, image2d,cameras, n_views=[2, 1], resample=False, timesteps=None):
         _device = image2d.device

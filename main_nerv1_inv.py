@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import torchvision
 
 torch.set_float32_matmul_precision("high")
-
+from pprint import pprint
 from typing import Optional
 from lightning_fabric.utilities.seed import seed_everything
 from lightning import Trainer, LightningModule
@@ -26,6 +26,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 
 # from monai.networks.layers import MedianFilter, BilateralFilter 
 from monai.losses import PerceptualLoss
+from monai.networks.blocks import Convolution, ADN, ResidualUnit
 
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -41,7 +42,7 @@ from pytorch3d.renderer.cameras import (
 
 from datamodule import UnpairedDataModule
 from dvr.renderer import DirectVolumeFrontToBackRenderer
-from nerv1.renderer import NeRVFrontToBackInverseRenderer
+from nerv1.renderer import NeRVFrontToBackInverseRenderer, backbones
 
 def make_cameras_dea(
     dist: torch.Tensor, 
@@ -112,10 +113,59 @@ class DXRLightningModule(LightningModule):
         )
 
         if self.ckpt:
+            inv_renderer_old = NeRVFrontToBackInverseRenderer(
+                in_channels=1, 
+                out_channels=self.sh ** 2 if self.sh > 0 else 1, 
+                vol_shape=self.vol_shape, 
+                img_shape=self.img_shape, 
+                fov_depth=self.fov_depth, 
+                sh=self.sh, 
+                pe=self.pe, 
+                backbone="efficientnet-b8", 
+                fwd_renderer=self.fwd_renderer,
+            )
+            
+            def rename_attribute(obj, old_name, new_name):
+                obj._modules[new_name] = obj._modules.pop(old_name)
+            
+            def find_layers(model):
+                layers = []
+                for child in model.children():
+                    if isinstance(child, Convolution) or isinstance(child, ResidualUnit) or isinstance(child, ADN):
+                        # Iterate inside each block and find all the nn parameters
+                        for param in child.parameters():
+                            if isinstance(param, nn.Parameter):
+                                layers.append(param)
+                    layers.extend(find_layers(child))
+                return layers
+
+          
+            def copy_weights(source_model, target_model):
+                source_layers = find_layers(source_model)
+                target_layers = find_layers(target_model)
+                               
+                for source_layer, target_layer in zip(source_layers, target_layers):
+                    print(f"Source Layer: {source_layer}")
+                    print(f"Target Layer: {target_layer}")
+                    
+                    num_filters_to_copy = min(source_layer.size(0), target_layer.size(0))
+
+                    # Copy overlapping weights and biases
+                    target_layer[:num_filters_to_copy].data = source_layer[:num_filters_to_copy].data
+
+            rename_attribute(inv_renderer_old, 'net2d3d', 'clarity_net')
+            rename_attribute(inv_renderer_old, 'net3d3d', 'density_net')
+            
             checkpoint = torch.load(self.ckpt, map_location=torch.device("cpu"))["state_dict"]
             state_dict = {k: v for k, v in checkpoint.items() if k in self.state_dict()}
-            self.load_state_dict(state_dict, strict=self.strict)
+            inv_renderer_old.load_state_dict(state_dict, strict=False)
+              
+            rename_attribute(inv_renderer_old, 'clarity_net', 'net2d3d')
+            rename_attribute(inv_renderer_old, 'density_net', 'net3d3d')
+             
+            copy_weights(inv_renderer_old, self.inv_renderer)
 
+    
         self.train_step_outputs = []
         self.validation_step_outputs = []
         self.l1loss = nn.L1Loss(reduction="mean")
@@ -201,16 +251,16 @@ class DXRLightningModule(LightningModule):
 
         im2d_loss_inv = (
             self.l1loss(figure_xr_hidden_inverse_hidden, figure_xr_hidden)
+            # + self.l1loss(figure_xr_hidden_inverse_random, figure_ct_hidden_inverse_random) * self.omega
             + self.l1loss(figure_ct_random_inverse_random, figure_ct_random)
             + self.l1loss(figure_ct_random_inverse_hidden, figure_ct_hidden)
-            + self.l1loss(figure_ct_hidden_inverse_random, figure_ct_random) * self.omega
-            + self.l1loss(figure_ct_hidden_inverse_hidden, figure_ct_hidden) * self.omega
+            + self.l1loss(figure_ct_hidden_inverse_random, figure_ct_random) 
+            + self.l1loss(figure_ct_hidden_inverse_hidden, figure_ct_hidden) 
         )
 
-        im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) + self.l1loss(volume_ct_random_inverse, image3d)
-        if self.current_epoch>10:
-            im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) + self.l1loss(volume_ct_random_inverse, image3d) \
-                          + self.l1loss(middle_ct_hidden_inverse, image3d) + self.l1loss(middle_ct_random_inverse, image3d)   
+        # im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) + self.l1loss(volume_ct_random_inverse, image3d)
+        im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) + self.l1loss(volume_ct_random_inverse, image3d) \
+                      + self.l1loss(middle_ct_hidden_inverse, image3d) + self.l1loss(middle_ct_random_inverse, image3d)   
             
         im2d_loss = im2d_loss_inv
         im3d_loss = im3d_loss_inv
@@ -302,10 +352,11 @@ class DXRLightningModule(LightningModule):
 
         im2d_loss_inv = (
             self.l1loss(figure_xr_hidden_inverse_hidden, figure_xr_hidden)
+            # + self.l1loss(figure_xr_hidden_inverse_random, figure_ct_hidden_inverse_random) * self.omega
             + self.l1loss(figure_ct_random_inverse_random, figure_ct_random)
             + self.l1loss(figure_ct_random_inverse_hidden, figure_ct_hidden)
-            + self.l1loss(figure_ct_hidden_inverse_random, figure_ct_random) * self.omega
-            + self.l1loss(figure_ct_hidden_inverse_hidden, figure_ct_hidden) * self.omega
+            + self.l1loss(figure_ct_hidden_inverse_random, figure_ct_random) 
+            + self.l1loss(figure_ct_hidden_inverse_hidden, figure_ct_hidden) 
         )
 
         im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) + self.l1loss(volume_ct_random_inverse, image3d)
@@ -560,7 +611,7 @@ if __name__ == "__main__":
     #############################################
 
     model = DXRLightningModule(hparams=hparams)
-    
+
     if hparams.test:
         trainer.test(
             model,
