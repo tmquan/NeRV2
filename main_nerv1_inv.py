@@ -8,7 +8,7 @@ import resource
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
 # print(rlimit)
 resource.setrlimit(resource.RLIMIT_NOFILE, (65536, rlimit[1]))
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,6 +44,26 @@ from datamodule import UnpairedDataModule
 from dvr.renderer import DirectVolumeFrontToBackRenderer
 from nerv1.renderer import NeRVFrontToBackInverseRenderer, backbones
 
+def init_weights(m):
+    # if isinstance(m, nn.Linear):
+    #     torch.nn.init.xavier_uniform(m.weight)
+    #     m.bias.data.fill_(0.01)
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.xavier_uniform(m.weight, gain=np.sqrt(2))
+        nn.init.constant(m.bias,0.0)
+    if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d)):
+        nn.init.xavier_uniform(m.weight, gain=np.sqrt(3))
+        nn.init.constant(m.bias,0.0)
+    elif isinstance(m, (nn.Linear)):
+        nn.init.xavier_uniform(m.weight, gain=np.sqrt(1))
+        if m.bias is not None:
+            nn.init.constant(m.bias,0.0)
+    elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d)):
+        nn.init.ones_(m.weight)
+        if m.bias is not None:
+            nn.init.constant(m.bias,0.0)
+
+            
 def make_cameras_dea(
     dist: torch.Tensor, 
     elev: torch.Tensor, 
@@ -113,59 +133,13 @@ class DXRLightningModule(LightningModule):
         )
 
         if self.ckpt:
-            inv_renderer_old = NeRVFrontToBackInverseRenderer(
-                in_channels=1, 
-                out_channels=self.sh ** 2 if self.sh > 0 else 1, 
-                vol_shape=self.vol_shape, 
-                img_shape=self.img_shape, 
-                fov_depth=self.fov_depth, 
-                sh=self.sh, 
-                pe=self.pe, 
-                backbone="efficientnet-b8", 
-                fwd_renderer=self.fwd_renderer,
-            )
-            
-            def rename_attribute(obj, old_name, new_name):
-                obj._modules[new_name] = obj._modules.pop(old_name)
-            
-            def find_layers(model):
-                layers = []
-                for child in model.children():
-                    if isinstance(child, Convolution) or isinstance(child, ResidualUnit) or isinstance(child, ADN):
-                        # Iterate inside each block and find all the nn parameters
-                        for param in child.parameters():
-                            if isinstance(param, nn.Parameter):
-                                layers.append(param)
-                    layers.extend(find_layers(child))
-                return layers
-
-          
-            def copy_weights(source_model, target_model):
-                source_layers = find_layers(source_model)
-                target_layers = find_layers(target_model)
-                               
-                for source_layer, target_layer in zip(source_layers, target_layers):
-                    print(f"Source Layer: {source_layer}")
-                    print(f"Target Layer: {target_layer}")
-                    
-                    num_filters_to_copy = min(source_layer.size(0), target_layer.size(0))
-
-                    # Copy overlapping weights and biases
-                    target_layer[:num_filters_to_copy].data = source_layer[:num_filters_to_copy].data
-
-            rename_attribute(inv_renderer_old, 'net2d3d', 'clarity_net')
-            rename_attribute(inv_renderer_old, 'net3d3d', 'density_net')
-            
+            print("Loading checkpoint...")
             checkpoint = torch.load(self.ckpt, map_location=torch.device("cpu"))["state_dict"]
-            state_dict = {k: v for k, v in checkpoint.items() if k in self.state_dict()}
-            inv_renderer_old.load_state_dict(state_dict, strict=False)
-              
-            rename_attribute(inv_renderer_old, 'clarity_net', 'net2d3d')
-            rename_attribute(inv_renderer_old, 'density_net', 'net3d3d')
-             
-            copy_weights(inv_renderer_old, self.inv_renderer)
+            state_dict = {k: v for k, v in checkpoint.items() if k in self.state_dict()}   
+            self.load_state_dict(state_dict, strict=False)
 
-    
+        self.inv_renderer.apply(init_weights)
+        
         self.train_step_outputs = []
         self.validation_step_outputs = []
         self.l1loss = nn.L1Loss(reduction="mean")
@@ -273,8 +247,8 @@ class DXRLightningModule(LightningModule):
         self.log(f"train_im3d_loss", im3d_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         self.log(f"train_perc_loss", perc_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         
-        # loss = self.alpha * im3d_loss + self.gamma * im2d_loss + (im2d_loss * im3d_loss) * perc_loss
-        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss
+        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + (im2d_loss * im3d_loss) * perc_loss
+        # loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss
         
         # Visualization step
         if batch_idx == 0:
@@ -626,7 +600,7 @@ if __name__ == "__main__":
             train_dataloaders=datamodule.train_dataloader(),
             val_dataloaders=datamodule.val_dataloader(),
             # datamodule=datamodule,
-            ckpt_path=hparams.ckpt if hparams.ckpt is not None and hparams.strict else None,  # "some/path/to/my_checkpoint.ckpt"
+            # ckpt_path=hparams.ckpt if hparams.ckpt is not None and hparams.strict else None,  # "some/path/to/my_checkpoint.ckpt"
         )
 
     # serve
