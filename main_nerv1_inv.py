@@ -27,7 +27,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 # from monai.networks.layers import MedianFilter, BilateralFilter 
 from monai.losses import PerceptualLoss
 from monai.networks.blocks import Convolution, ADN, ResidualUnit
-
+from monai.networks import normal_init
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
@@ -44,25 +44,36 @@ from datamodule import UnpairedDataModule
 from dvr.renderer import DirectVolumeFrontToBackRenderer
 from nerv1.renderer import NeRVFrontToBackInverseRenderer, backbones
 
-def init_weights(m):
-    # if isinstance(m, nn.Linear):
-    #     torch.nn.init.xavier_uniform(m.weight)
-    #     m.bias.data.fill_(0.01)
-    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-        nn.init.xavier_uniform(m.weight, gain=np.sqrt(2))
-        nn.init.constant(m.bias,0.0)
-    if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d)):
-        nn.init.xavier_uniform(m.weight, gain=np.sqrt(3))
-        nn.init.constant(m.bias,0.0)
-    elif isinstance(m, (nn.Linear)):
-        nn.init.xavier_uniform(m.weight, gain=np.sqrt(1))
-        if m.bias is not None:
-            nn.init.constant(m.bias,0.0)
-    elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d)):
-        nn.init.ones_(m.weight)
-        if m.bias is not None:
-            nn.init.constant(m.bias,0.0)
+def init_weights(net, init_type='normal', init_gain=0.02):
+    """Initialize network weights.
+    Parameters:
+        net (network)   -- network to be initialized
+        init_type (str) -- the name of an initialization method: normal | xavier | kaiming | orthogonal
+        init_gain (float)    -- scaling factor for normal, xavier and orthogonal.
+    We use 'normal' in the original pix2pix and CycleGAN paper. But xavier and kaiming might
+    work better for some applications. Feel free to try yourself.
+    """
+    def init_func(m):  # define the initialization function
+        classname = m.__class__.__name__
+        if hasattr(m, 'weight') and (classname.find('Conv') != -1 or classname.find('Linear') != -1):
+            if init_type == 'normal':
+                nn.init.normal_(m.weight.data, 0.0, init_gain)
+            elif init_type == 'xavier':
+                nn.init.xavier_normal_(m.weight.data, gain=init_gain)
+            elif init_type == 'kaiming':
+                nn.init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
+            elif init_type == 'orthogonal':
+                nn.init.orthogonal_(m.weight.data, gain=init_gain)
+            else:
+                raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.constant_(m.bias.data, 0.0)
+        elif classname.find('BatchNorm') != -1:  # BatchNorm Layer's weight is not a matrix; only normal distribution applies.
+            nn.init.normal_(m.weight.data, 1.0, init_gain)
+            nn.init.constant_(m.bias.data, 0.0)
 
+    # print('initialize network with %s' % init_type)
+    net.apply(init_func)  # apply the initialization function <init_func>
             
 def make_cameras_dea(
     dist: torch.Tensor, 
@@ -138,7 +149,7 @@ class DXRLightningModule(LightningModule):
             state_dict = {k: v for k, v in checkpoint.items() if k in self.state_dict()}   
             self.load_state_dict(state_dict, strict=False)
 
-        self.inv_renderer.apply(init_weights)
+        init_weights(self.inv_renderer, init_type='xavier')
         
         self.train_step_outputs = []
         self.validation_step_outputs = []
