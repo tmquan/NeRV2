@@ -154,6 +154,7 @@ class DXRLightningModule(LightningModule):
         self.train_step_outputs = []
         self.validation_step_outputs = []
         self.l1loss = nn.L1Loss(reduction="mean")
+        self.l2loss = nn.MSELoss(reduction="mean")
         
         self.piloss = PerceptualLoss(
             spatial_dims=2, 
@@ -235,15 +236,15 @@ class DXRLightningModule(LightningModule):
             volume_ct_hidden_inverse = volume_ct_hidden_inverse.sum(dim=1, keepdim=True)
 
         im2d_loss_inv = (
-            self.l1loss(figure_xr_hidden_inverse_hidden, figure_xr_hidden)
-            + self.l1loss(figure_ct_random_inverse_random, figure_ct_random) * self.theta
-            + self.l1loss(figure_ct_random_inverse_hidden, figure_ct_hidden) * self.theta
-            + self.l1loss(figure_ct_hidden_inverse_random, figure_ct_random) 
-            + self.l1loss(figure_ct_hidden_inverse_hidden, figure_ct_hidden) 
+            self.l2loss(figure_xr_hidden_inverse_hidden, figure_xr_hidden)
+            + self.l2loss(figure_ct_random_inverse_random, figure_ct_random) * self.theta
+            + self.l2loss(figure_ct_random_inverse_hidden, figure_ct_hidden) * self.theta
+            + self.l2loss(figure_ct_hidden_inverse_random, figure_ct_random) 
+            + self.l2loss(figure_ct_hidden_inverse_hidden, figure_ct_hidden) 
         )
 
-        im3d_loss_inv = self.l1loss(volume_ct_hidden_inverse, image3d) + self.l1loss(volume_ct_random_inverse, image3d) * self.theta \
-                      + self.l1loss(middle_ct_hidden_inverse, image3d) + self.l1loss(middle_ct_random_inverse, image3d) * self.theta  
+        im3d_loss_inv = self.l2loss(volume_ct_hidden_inverse, image3d) + self.l2loss(volume_ct_random_inverse, image3d) * self.theta \
+                      + self.l2loss(middle_ct_hidden_inverse, image3d) + self.l2loss(middle_ct_random_inverse, image3d) * self.theta  
             
         im2d_loss = im2d_loss_inv
         im3d_loss = im3d_loss_inv
@@ -256,7 +257,7 @@ class DXRLightningModule(LightningModule):
         self.log(f"train_im3d_loss", im3d_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         self.log(f"train_perc_loss", perc_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         
-        # loss = self.alpha * im3d_loss + self.gamma * im2d_loss + (im2d_loss * im3d_loss) * perc_loss
+        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + (im2d_loss * im3d_loss) * perc_loss / self.theta
         loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss
         
         # Visualization step
