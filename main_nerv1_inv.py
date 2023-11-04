@@ -146,8 +146,8 @@ class DXRLightningModule(LightningModule):
         if self.ckpt:
             print("Loading checkpoint...")
             checkpoint = torch.load(self.ckpt, map_location=torch.device("cpu"))["state_dict"]
-            state_dict = {k: v for k, v in checkpoint.items() if k in self.state_dict()}   
-            self.load_state_dict(state_dict, strict=False)
+            state_dict = {k: v for k, v in checkpoint.items() if k in self.state_dict()}
+            self.load_state_dict(state_dict, strict=self.strict)
 
         init_weights(self.inv_renderer, init_type='xavier')
         
@@ -248,8 +248,8 @@ class DXRLightningModule(LightningModule):
             
         im2d_loss = im2d_loss_inv
         im3d_loss = im3d_loss_inv
-        perc_loss = self.piloss(figure_xr_hidden_inverse_random.float(), figure_ct_random.float())
-        # perc_loss = self.piloss(figure_xr_hidden_inverse_random.float(), figure_ct_hidden_inverse_random.float())
+        # perc_loss = self.piloss(figure_xr_hidden_inverse_random.float(), figure_ct_random.float())
+        perc_loss = self.piloss(figure_xr_hidden_inverse_random.float(), figure_ct_hidden_inverse_random.float())
         # perc_loss = self.piloss(image3d.float(), volume_xr_hidden_inverse.float())
         
         # Log the final losses
@@ -258,7 +258,7 @@ class DXRLightningModule(LightningModule):
         self.log(f"train_perc_loss", perc_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         
         loss = self.alpha * im3d_loss + self.gamma * im2d_loss + (im2d_loss * im3d_loss) * perc_loss / self.theta
-        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss
+        # loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss
         
         # Visualization step
         if batch_idx == 0:
@@ -610,7 +610,7 @@ if __name__ == "__main__":
             train_dataloaders=datamodule.train_dataloader(),
             val_dataloaders=datamodule.val_dataloader(),
             # datamodule=datamodule,
-            # ckpt_path=hparams.ckpt if hparams.ckpt is not None and hparams.strict else None,  # "some/path/to/my_checkpoint.ckpt"
+            ckpt_path=hparams.ckpt if hparams.ckpt is not None and hparams.strict else None,  # "some/path/to/my_checkpoint.ckpt"
         )
 
     # serve

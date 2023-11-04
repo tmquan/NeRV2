@@ -68,11 +68,11 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
                 num_res_units=2, 
                 kernel_size=3, 
                 up_kernel_size=3, 
-                act=("LeakyReLU", {"inplace": True}), 
+                act=("ReLU", {"inplace": True}), 
                 norm=Norm.BATCH,
                 dropout=0.5
             ),
-            nn.Sigmoid(),
+            # nn.Sigmoid(),
         )
         
     def forward(self, image2d, cameras, timesteps=None, resample=True, is_training=False):
