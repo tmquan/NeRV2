@@ -257,8 +257,8 @@ class DXRLightningModule(LightningModule):
         self.log(f"train_im3d_loss", im3d_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         self.log(f"train_perc_loss", perc_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size,)
         
-        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + (im2d_loss * im3d_loss) * perc_loss / self.theta
-        # loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss
+        # loss = self.alpha * im3d_loss + self.gamma * im2d_loss + (im2d_loss * im3d_loss) * perc_loss / self.theta
+        loss = self.alpha * im3d_loss + self.gamma * im2d_loss + self.lamda * perc_loss
         
         # Visualization step
         if batch_idx == 0:

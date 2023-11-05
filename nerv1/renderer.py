@@ -46,7 +46,7 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
         self.fwd_renderer = fwd_renderer
         assert backbone in backbones.keys()
 
-        self.net2d3d = DiffusionModelUNet(
+        self.clarity_net = DiffusionModelUNet(
             spatial_dims=2,
             in_channels=1,  # Condition with straight/hidden view
             out_channels=self.fov_depth,
@@ -58,7 +58,7 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
             cross_attention_dim=12,  # flatR | flatT
         )
         
-        self.net3d3d = nn.Sequential(
+        self.density_net = nn.Sequential(
             Unet(
                 spatial_dims=3, 
                 in_channels=1, 
@@ -68,7 +68,7 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
                 num_res_units=2, 
                 kernel_size=3, 
                 up_kernel_size=3, 
-                act=("ReLU", {"inplace": True}), 
+                act=("LeakyReLU", {"inplace": True}), 
                 norm=Norm.BATCH,
                 dropout=0.5
             ),
@@ -87,7 +87,7 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
         
         mat = torch.cat([R, T], dim=-1)
         # rot = R
-        mid = self.net2d3d(
+        mid = self.clarity_net(
             x=image2d,
             context=mat.reshape(batch, 1, -1),
             timesteps=timesteps,
@@ -102,10 +102,10 @@ class NeRVFrontToBackInverseRenderer(nn.Module):
             # Randomly return out_resample or out_explicit
             rng = torch.rand(1).item()
             if rng > 0.5:
-                out = self.net3d3d(mid)
+                out = self.density_net(mid)
                 out = F.grid_sample(out, grd)
             else:
-                out = self.net3d3d(mid_resample)
+                out = self.density_net(mid_resample)
         else:
-            out = self.net3d3d(mid_resample)
+            out = self.density_net(mid_resample)
         return out, mid_resample
